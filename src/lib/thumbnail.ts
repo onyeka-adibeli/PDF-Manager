@@ -6,18 +6,44 @@ export interface PDFInfo {
 }
 
 export async function extractPDFInfo(file: File): Promise<PDFInfo> {
+  if (!file || file.size === 0) {
+    throw new Error('File is empty (0 bytes)');
+  }
+
   const arrayBuffer = await file.arrayBuffer();
-  // Copy buffer to prevent detachment issues
-  const bufferCopy = arrayBuffer.slice(0);
-  
-  const loadingTask = pdfjsLib.getDocument({ data: bufferCopy });
+  if (arrayBuffer.byteLength === 0) {
+    throw new Error('File has 0 bytes');
+  }
+
+  // Scan for %PDF- header to handle files with leading BOM or whitespace
+  const bytes = new Uint8Array(arrayBuffer);
+  const pdfHeader = [0x25, 0x50, 0x44, 0x46, 0x2d]; // '%PDF-'
+  let cleanBuffer: ArrayBuffer = arrayBuffer.slice(0);
+
+  const searchLimit = Math.min(bytes.length - 4, 2048);
+  for (let i = 0; i < searchLimit; i++) {
+    if (
+      bytes[i] === pdfHeader[0] &&
+      bytes[i + 1] === pdfHeader[1] &&
+      bytes[i + 2] === pdfHeader[2] &&
+      bytes[i + 3] === pdfHeader[3] &&
+      bytes[i + 4] === pdfHeader[4]
+    ) {
+      if (i > 0) {
+        cleanBuffer = arrayBuffer.slice(i);
+      }
+      break;
+    }
+  }
+
+  const loadingTask = pdfjsLib.getDocument({ data: cleanBuffer });
   const pdfDoc = await loadingTask.promise;
   const pageCount = pdfDoc.numPages;
 
   // Render page 1 for thumbnail
   const page = await pdfDoc.getPage(1);
   const unscaledViewport = page.getViewport({ scale: 1 });
-  
+
   // Target thumbnail width around 240px
   const targetWidth = 240;
   const scale = targetWidth / unscaledViewport.width;
@@ -51,4 +77,3 @@ export async function extractPDFInfo(file: File): Promise<PDFInfo> {
     thumbnailUrl,
   };
 }
-

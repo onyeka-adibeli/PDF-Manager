@@ -1,5 +1,6 @@
 import { PDFDocument, PDFName } from 'pdf-lib';
 import { pdfjsLib } from './pdfWorker';
+import { sanitizePdfBuffer } from './pdfMerger';
 import { CompressionOptions, PresetConfig, CompressionPreset } from '../types';
 
 export const PRESET_CONFIGS: Record<CompressionPreset, PresetConfig> = {
@@ -83,8 +84,17 @@ export async function compressPDF(
   const startTime = performance.now();
   const originalSize = file.size;
 
+  if (file.size === 0) {
+    throw new Error(`File "${file.name}" is empty (0 bytes).`);
+  }
+
   onProgress?.(5, 'Reading PDF file...');
   const arrayBuffer = await file.arrayBuffer();
+  if (arrayBuffer.byteLength === 0) {
+    throw new Error(`File "${file.name}" has no readable content (0 bytes).`);
+  }
+
+  const { cleanBuffer } = sanitizePdfBuffer(arrayBuffer);
 
   let compressedBytes: Uint8Array;
 
@@ -92,7 +102,7 @@ export async function compressPDF(
     // Smart Mode: tries structural and stream optimization first
     onProgress?.(15, 'Analyzing PDF structure & objects...');
     try {
-      const pdfLibDoc = await PDFDocument.load(arrayBuffer.slice(0), {
+      const pdfLibDoc = await PDFDocument.load(cleanBuffer.slice(0), {
         ignoreEncryption: true,
       });
 
@@ -132,7 +142,7 @@ export async function compressPDF(
         // Fall back to high-fidelity raster re-encoding with text preservation fallback
         onProgress?.(35, 'Compressing embedded pages and image data...');
         compressedBytes = await compressByRenderingPages(
-          arrayBuffer,
+          cleanBuffer,
           options,
           onProgress
         );
@@ -141,7 +151,7 @@ export async function compressPDF(
       // In case of any structural parsing failure, fallback to rendering engine
       onProgress?.(30, 'Re-encoding page visual layers...');
       compressedBytes = await compressByRenderingPages(
-        arrayBuffer,
+        cleanBuffer,
         options,
         onProgress
       );
@@ -149,7 +159,7 @@ export async function compressPDF(
   } else {
     // Scanned / Raster mode: direct page-by-page canvas compression
     compressedBytes = await compressByRenderingPages(
-      arrayBuffer,
+      cleanBuffer,
       options,
       onProgress
     );

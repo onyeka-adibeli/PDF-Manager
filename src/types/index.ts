@@ -55,6 +55,7 @@ export interface MergeFileItem {
   file: File;
   name: string;
   size: number;
+  fileType: 'pdf' | 'image' | 'docx' | 'text';
   pageCount?: number;
   thumbnailUrl?: string;
   status: 'ready' | 'processing' | 'error';

@@ -13,11 +13,16 @@ import {
   Loader2,
   Hash,
   AlertCircle,
+  FileCode,
+  Image as ImageIcon,
+  X,
+  RefreshCw,
 } from 'lucide-react';
 import { MergeFileItem, MergeOptions, MergeResult } from '../types';
 import { mergePDFs } from '../lib/pdfMerger';
 import { extractPDFInfo } from '../lib/thumbnail';
 import { formatBytes } from '../lib/utils';
+import { detectConvertibleType } from '../lib/pdfConverter';
 
 interface MergeViewProps {
   onPreviewMerged: (file: File, name: string) => void;
@@ -30,6 +35,7 @@ export const MergeView: React.FC<MergeViewProps> = ({ onPreviewMerged }) => {
   const [mergeProgress, setMergeProgress] = useState(0);
   const [progressText, setProgressText] = useState('');
   const [mergeResult, setMergeResult] = useState<MergeResult | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [options, setOptions] = useState<MergeOptions>({
     outputFilename: 'merged_document.pdf',
     addPageNumbers: true,
@@ -39,22 +45,35 @@ export const MergeView: React.FC<MergeViewProps> = ({ onPreviewMerged }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFiles = async (fileList: FileList | File[]) => {
+    setErrorMessage(null);
     const newItems: MergeFileItem[] = [];
 
     for (let i = 0; i < fileList.length; i++) {
       const file = fileList[i];
-      const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
-      const isImage = file.type.startsWith('image/') || /\.(png|jpe?g|webp|bmp|gif|svg)$/i.test(file.name);
+      let fileType: 'pdf' | 'image' | 'docx' | 'text' = 'pdf';
 
-      if (isPdf || isImage) {
-        newItems.push({
-          id: `${file.name}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          file,
-          name: file.name,
-          size: file.size,
-          status: 'ready',
-        });
+      if (file.name.toLowerCase().endsWith('.pdf') || file.type === 'application/pdf') {
+        fileType = 'pdf';
+      } else if (file.type.startsWith('image/') || /\.(png|jpe?g|webp|bmp|gif|svg)$/i.test(file.name)) {
+        fileType = 'image';
+      } else if (/\.(docx|doc)$/i.test(file.name) || file.type.includes('wordprocessingml') || file.type.includes('msword')) {
+        fileType = 'docx';
+      } else {
+        fileType = 'text';
       }
+
+      // Check if file is empty (0 bytes)
+      const isEmpty = file.size === 0;
+
+      newItems.push({
+        id: `${file.name}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+        file,
+        name: file.name,
+        size: file.size,
+        fileType,
+        status: isEmpty ? 'error' : 'ready',
+        error: isEmpty ? 'File is empty (0 bytes) and cannot be merged' : undefined,
+      });
     }
 
     if (newItems.length === 0) return;
@@ -62,26 +81,59 @@ export const MergeView: React.FC<MergeViewProps> = ({ onPreviewMerged }) => {
     setItems((prev) => [...prev, ...newItems]);
     setMergeResult(null);
 
-    // Extract page counts and thumbnails for PDFs
+    // Asynchronously validate content & extract thumbnails
     newItems.forEach(async (item) => {
-      if (item.file.type === 'application/pdf' || item.file.name.toLowerCase().endsWith('.pdf')) {
+      if (item.status === 'error') return;
+
+      if (item.fileType === 'pdf') {
         try {
           const info = await extractPDFInfo(item.file);
           setItems((prev) =>
             prev.map((it) =>
               it.id === item.id
-                ? { ...it, pageCount: info.pageCount, thumbnailUrl: info.thumbnailUrl }
+                ? {
+                    ...it,
+                    pageCount: info.pageCount,
+                    thumbnailUrl: info.thumbnailUrl,
+                    status: 'ready',
+                    error: undefined,
+                  }
+                : it
+            )
+          );
+        } catch (err: any) {
+          setItems((prev) =>
+            prev.map((it) =>
+              it.id === item.id
+                ? {
+                    ...it,
+                    status: 'error',
+                    error: `Invalid PDF: ${err?.message || 'No valid PDF header found'}`,
+                  }
+                : it
+            )
+          );
+        }
+      } else if (item.fileType === 'image') {
+        try {
+          const url = URL.createObjectURL(item.file);
+          setItems((prev) =>
+            prev.map((it) =>
+              it.id === item.id
+                ? { ...it, pageCount: 1, thumbnailUrl: url, status: 'ready' }
                 : it
             )
           );
         } catch {
-          // Ignore thumbnail error
+          // Keep as ready
         }
-      } else {
-        // Image thumbnail
-        const url = URL.createObjectURL(item.file);
+      } else if (item.fileType === 'docx') {
         setItems((prev) =>
-          prev.map((it) => (it.id === item.id ? { ...it, pageCount: 1, thumbnailUrl: url } : it))
+          prev.map((it) => (it.id === item.id ? { ...it, pageCount: 1, status: 'ready' } : it))
+        );
+      } else {
+        setItems((prev) =>
+          prev.map((it) => (it.id === item.id ? { ...it, pageCount: 1, status: 'ready' } : it))
         );
       }
     });
@@ -102,12 +154,38 @@ export const MergeView: React.FC<MergeViewProps> = ({ onPreviewMerged }) => {
   };
 
   const removeItem = (id: string) => {
-    setItems((prev) => prev.filter((it) => it.id !== id));
+    setItems((prev) => {
+      const target = prev.find((it) => it.id === id);
+      if (target?.thumbnailUrl && target.fileType === 'image') {
+        URL.revokeObjectURL(target.thumbnailUrl);
+      }
+      return prev.filter((it) => it.id !== id);
+    });
     setMergeResult(null);
   };
 
+  const removeInvalidFiles = () => {
+    setItems((prev) => prev.filter((it) => it.status !== 'error'));
+    setErrorMessage(null);
+  };
+
   const handleMerge = async () => {
-    if (items.length < 2) return;
+    setErrorMessage(null);
+
+    // Validate that no error/empty items exist
+    const invalidItems = items.filter((it) => it.status === 'error' || it.size === 0);
+    if (invalidItems.length > 0) {
+      setErrorMessage(
+        `Cannot merge: "${invalidItems[0].name}" is empty or invalid. Please remove invalid files before proceeding.`
+      );
+      return;
+    }
+
+    if (items.length < 2) {
+      setErrorMessage('Please add at least 2 valid documents or images to merge.');
+      return;
+    }
+
     setIsMerging(true);
     setMergeProgress(0);
 
@@ -118,7 +196,7 @@ export const MergeView: React.FC<MergeViewProps> = ({ onPreviewMerged }) => {
       });
       setMergeResult(result);
     } catch (err: any) {
-      alert(`Merge failed: ${err?.message || 'Unknown error'}`);
+      setErrorMessage(err?.message || 'An unexpected error occurred during merging.');
     } finally {
       setIsMerging(false);
     }
@@ -136,6 +214,7 @@ export const MergeView: React.FC<MergeViewProps> = ({ onPreviewMerged }) => {
     document.body.removeChild(a);
   };
 
+  const hasInvalidItems = items.some((it) => it.status === 'error' || it.size === 0);
   const totalPages = items.reduce((sum, item) => sum + (item.pageCount || 1), 0);
   const totalBytes = items.reduce((sum, item) => sum + item.size, 0);
 
@@ -148,12 +227,40 @@ export const MergeView: React.FC<MergeViewProps> = ({ onPreviewMerged }) => {
           Multi-File PDF Merger
         </div>
         <h2 className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">
-          Combine multiple PDFs & images into one file
+          Combine multiple PDFs, images & docs into one file
         </h2>
         <p className="text-xs sm:text-sm text-slate-400 mt-1">
           Arrange files in your desired sequence. Processed 100% locally with zero file uploads.
         </p>
       </div>
+
+      {/* Error Banner */}
+      {errorMessage && (
+        <div className="p-4 rounded-xl bg-rose-950/60 border border-rose-500/40 text-rose-200 text-xs flex items-start justify-between gap-3 shadow-lg animate-fade-in">
+          <div className="flex items-start gap-2.5 min-w-0">
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-bold text-rose-300">Merge Error</p>
+              <p className="mt-0.5 leading-relaxed text-rose-200/90">{errorMessage}</p>
+              {hasInvalidItems && (
+                <button
+                  onClick={removeInvalidFiles}
+                  className="mt-2.5 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 font-semibold border border-rose-500/30 transition-colors"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Remove Invalid Files</span>
+                </button>
+              )}
+            </div>
+          </div>
+          <button
+            onClick={() => setErrorMessage(null)}
+            className="p-1 rounded-lg text-rose-400 hover:text-white hover:bg-rose-900/40 transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Dropzone */}
       <div
@@ -177,7 +284,7 @@ export const MergeView: React.FC<MergeViewProps> = ({ onPreviewMerged }) => {
         <input
           ref={fileInputRef}
           type="file"
-          accept=".pdf,application/pdf,image/*"
+          accept=".pdf,application/pdf,image/*,.docx,.doc,.txt,.md,.json,.csv,.html"
           multiple
           onChange={(e) => e.target.files && handleFiles(e.target.files)}
           className="hidden"
@@ -185,9 +292,9 @@ export const MergeView: React.FC<MergeViewProps> = ({ onPreviewMerged }) => {
         <div className="w-14 h-14 rounded-2xl bg-blue-500/10 border border-blue-500/30 flex items-center justify-center text-blue-400 mx-auto mb-3">
           <Layers className="w-7 h-7" />
         </div>
-        <h3 className="font-bold text-white text-base">Drop PDFs or images here to merge</h3>
+        <h3 className="font-bold text-white text-base">Drop files here to merge</h3>
         <p className="text-xs text-slate-400 mt-1">
-          Combine any number of PDF documents and photos into a single PDF
+          Supports PDFs, Images (PNG, JPG, WEBP), Word Documents (.docx), and Text (.txt)
         </p>
         <button
           type="button"
@@ -205,13 +312,23 @@ export const MergeView: React.FC<MergeViewProps> = ({ onPreviewMerged }) => {
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between p-4 rounded-xl bg-slate-900 border border-slate-800 gap-3">
             <div className="flex items-center gap-4 text-xs">
               <span className="font-bold text-white text-sm">
-                {items.length} files selected
+                {items.length} files in queue
               </span>
               <span className="text-slate-400">Total: {formatBytes(totalBytes)}</span>
               <span className="text-blue-400 font-mono">~{totalPages} pages</span>
             </div>
 
-            <div className="flex items-center gap-3 text-xs w-full sm:w-auto">
+            <div className="flex items-center gap-4 text-xs w-full sm:w-auto justify-between sm:justify-end">
+              {hasInvalidItems && (
+                <button
+                  onClick={removeInvalidFiles}
+                  className="text-rose-400 hover:text-rose-300 font-semibold flex items-center gap-1"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Remove invalid</span>
+                </button>
+              )}
+
               <label className="flex items-center gap-2 text-slate-300 cursor-pointer">
                 <input
                   type="checkbox"
@@ -220,81 +337,125 @@ export const MergeView: React.FC<MergeViewProps> = ({ onPreviewMerged }) => {
                   className="rounded bg-slate-800 border-slate-700 text-blue-500 focus:ring-0"
                 />
                 <Hash className="w-3.5 h-3.5 text-blue-400" />
-                <span>Add sequential page numbers</span>
+                <span>Add page numbers</span>
               </label>
             </div>
           </div>
 
           {/* List items with Up/Down buttons */}
           <div className="space-y-2">
-            {items.map((item, index) => (
-              <div
-                key={item.id}
-                className="flex items-center justify-between p-3 rounded-xl bg-slate-900/60 border border-slate-800 hover:border-slate-700 transition-colors"
-              >
-                <div className="flex items-center gap-3 min-w-0">
-                  <span className="w-6 h-6 rounded-lg bg-slate-800 text-slate-400 text-xs font-mono font-bold flex items-center justify-center shrink-0">
-                    {index + 1}
-                  </span>
+            {items.map((item, index) => {
+              const isError = item.status === 'error';
 
-                  {item.thumbnailUrl ? (
-                    <img
-                      src={item.thumbnailUrl}
-                      alt=""
-                      className="w-10 h-12 object-cover rounded bg-slate-950 border border-slate-800 shrink-0"
-                    />
-                  ) : (
-                    <div className="w-10 h-12 rounded bg-slate-950 border border-slate-800 flex items-center justify-center text-slate-600 shrink-0">
-                      <FileText className="w-5 h-5" />
-                    </div>
-                  )}
+              return (
+                <div
+                  key={item.id}
+                  className={`flex items-center justify-between p-3 rounded-xl border transition-colors ${
+                    isError
+                      ? 'bg-rose-950/20 border-rose-500/50 hover:border-rose-500'
+                      : 'bg-slate-900/60 border-slate-800 hover:border-slate-700'
+                  }`}
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <span
+                      className={`w-6 h-6 rounded-lg text-xs font-mono font-bold flex items-center justify-center shrink-0 ${
+                        isError
+                          ? 'bg-rose-500/20 text-rose-400'
+                          : 'bg-slate-800 text-slate-400'
+                      }`}
+                    >
+                      {index + 1}
+                    </span>
 
-                  <div className="min-w-0">
-                    <p className="font-semibold text-white text-xs sm:text-sm truncate" title={item.name}>
-                      {item.name}
-                    </p>
-                    <div className="flex items-center gap-2 text-[11px] text-slate-400 font-mono mt-0.5">
-                      <span>{formatBytes(item.size)}</span>
-                      {item.pageCount && (
-                        <>
-                          <span>•</span>
-                          <span className="text-blue-400">{item.pageCount} page(s)</span>
-                        </>
-                      )}
+                    {item.thumbnailUrl ? (
+                      <img
+                        src={item.thumbnailUrl}
+                        alt=""
+                        className="w-10 h-12 object-cover rounded bg-slate-950 border border-slate-800 shrink-0"
+                      />
+                    ) : item.fileType === 'docx' ? (
+                      <div className="w-10 h-12 rounded bg-blue-950/40 border border-blue-800/40 flex items-center justify-center text-blue-400 shrink-0">
+                        <FileText className="w-5 h-5" />
+                      </div>
+                    ) : item.fileType === 'text' ? (
+                      <div className="w-10 h-12 rounded bg-slate-950 border border-slate-800 flex items-center justify-center text-slate-400 shrink-0">
+                        <FileCode className="w-5 h-5" />
+                      </div>
+                    ) : (
+                      <div className="w-10 h-12 rounded bg-slate-950 border border-slate-800 flex items-center justify-center text-slate-600 shrink-0">
+                        <FileText className="w-5 h-5" />
+                      </div>
+                    )}
+
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <p
+                          className={`font-semibold text-xs sm:text-sm truncate ${
+                            isError ? 'text-rose-200' : 'text-white'
+                          }`}
+                          title={item.name}
+                        >
+                          {item.name}
+                        </p>
+                        <span className="px-1.5 py-0.2 rounded text-[10px] uppercase font-mono font-bold bg-slate-800 text-slate-400">
+                          {item.fileType}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-2 text-[11px] font-mono mt-0.5">
+                        <span className={item.size === 0 ? 'text-rose-400 font-bold' : 'text-slate-400'}>
+                          {formatBytes(item.size)}
+                        </span>
+                        {item.pageCount && !isError && (
+                          <>
+                            <span className="text-slate-600">•</span>
+                            <span className="text-blue-400">{item.pageCount} page(s)</span>
+                          </>
+                        )}
+                        {isError && item.error && (
+                          <>
+                            <span className="text-slate-600">•</span>
+                            <span className="text-rose-400 flex items-center gap-1 font-sans">
+                              <AlertCircle className="w-3 h-3 shrink-0" />
+                              {item.error}
+                            </span>
+                          </>
+                        )}
+                      </div>
                     </div>
                   </div>
+
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      onClick={() => moveItem(index, 'up')}
+                      disabled={index === 0 || isMerging}
+                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-20 transition-colors"
+                      title="Move Up"
+                    >
+                      <ArrowUp className="w-3.5 h-3.5" />
+                    </button>
+
+                    <button
+                      onClick={() => moveItem(index, 'down')}
+                      disabled={index === items.length - 1 || isMerging}
+                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-20 transition-colors"
+                      title="Move Down"
+                    >
+                      <ArrowDown className="w-3.5 h-3.5" />
+                    </button>
+
+                    <button
+                      onClick={() => removeItem(item.id)}
+                      disabled={isMerging}
+                      className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition-colors"
+                      title="Remove"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                 </div>
-
-                <div className="flex items-center gap-1.5 shrink-0">
-                  <button
-                    onClick={() => moveItem(index, 'up')}
-                    disabled={index === 0 || isMerging}
-                    className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-20 transition-colors"
-                    title="Move Up"
-                  >
-                    <ArrowUp className="w-3.5 h-3.5" />
-                  </button>
-
-                  <button
-                    onClick={() => moveItem(index, 'down')}
-                    disabled={index === items.length - 1 || isMerging}
-                    className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-20 transition-colors"
-                    title="Move Down"
-                  >
-                    <ArrowDown className="w-3.5 h-3.5" />
-                  </button>
-
-                  <button
-                    onClick={() => removeItem(item.id)}
-                    disabled={isMerging}
-                    className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition-colors"
-                    title="Remove"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
 
           {/* Merge Options & Trigger */}
@@ -314,7 +475,7 @@ export const MergeView: React.FC<MergeViewProps> = ({ onPreviewMerged }) => {
             <div className="flex items-center gap-3 w-full sm:w-auto justify-end">
               <button
                 onClick={handleMerge}
-                disabled={items.length < 2 || isMerging}
+                disabled={items.length < 2 || isMerging || hasInvalidItems}
                 className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-2.5 rounded-xl font-bold text-xs bg-blue-600 hover:bg-blue-500 text-white transition-all shadow-lg shadow-blue-600/30 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isMerging ? (
